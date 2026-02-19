@@ -1,8 +1,14 @@
+from typing import Optional, Text, Union
+import uuid
+import numpy as np
+from numpy import ndarray
+from .process_tensor import BaseProcessTensor, NpDtype, create_delta_lastindex
+
 class TTInvariantProcessTensor(BaseProcessTensor):
 
     def __init__(
             self,
-            tebd: iTEBD_TEMPO_oqupy,
+            process_tensor: BaseProcessTensor,
             transform_in: Optional[ndarray] = None,
             transform_out: Optional[ndarray] = None,
             name: Optional[Text] = None,
@@ -11,32 +17,32 @@ class TTInvariantProcessTensor(BaseProcessTensor):
 
         self.uuid = str(uuid.uuid4())[:14]
         self._initial_tensor = None
-        hilbert_space_dimension = tebd.s_dim
-        dt = tebd.delta
-        self._tebd = tebd
+        
+        hilbert_space_dimension = process_tensor.hilbert_space_dimension
+        dt = process_tensor.dt
 
-        self._mpo_tensor = np.transpose(tebd.f[:, :-1, :], [0, 2, 1])
-        self._first_mpo_tensor = ncon(
-            [tebd.v_l, self._mpo_tensor], [[1], [1, -1, -2]]
-        )
-        self._first_mpo_tensor.shape = tuple([1] + list(self._first_mpo_tensor.shape))
+        max_step = process_tensor.max_step
+        if max_step == float('inf'):
+            last_idx = 1
+        else:
+            last_idx = int(max_step - 1) if max_step > 0 else 0
 
-        tensor = self._first_mpo_tensor
+        # Extract tensors
+        self._mpo_tensor = process_tensor.get_mpo_tensor(last_idx).copy()
+        self._first_mpo_tensor = process_tensor.get_mpo_tensor(0).copy()
+
         if transform_in is not None:
-            tensor = np.dot(np.moveaxis(tensor, -2, -1), transform_in.T)
-            tensor = np.moveaxis(tensor, -1, -2)
-        if transform_out is not None:
-            tensor = np.dot(tensor, transform_out)
-        self._first_mpo_tensor = tensor
+            for attr in ['_first_mpo_tensor', '_mpo_tensor']:
+                t = getattr(self, attr)
+                t = np.dot(np.moveaxis(t, -2, -1), transform_in.T)
+                setattr(self, attr, np.moveaxis(t, -1, -2))
 
-        if not (transform_in is None and transform_out is None and opti):
-            tensor = create_delta_lastindex(self._mpo_tensor)
-            if transform_in is not None:
-                tensor = np.dot(np.moveaxis(tensor, -2, -1), transform_in.T)
-                tensor = np.moveaxis(tensor, -1, -2)
-            if transform_out is not None:
-                tensor = np.dot(tensor, transform_out)
-            self._mpo_tensor = tensor
+        if transform_out is not None:
+            self._first_mpo_tensor = np.dot(self._first_mpo_tensor, transform_out)
+            self._mpo_tensor = np.dot(self._mpo_tensor, transform_out)
+
+        if opti:
+            self._mpo_tensor = create_delta_lastindex(self._mpo_tensor)
 
         super().__init__(
             hilbert_space_dimension,
@@ -49,28 +55,27 @@ class TTInvariantProcessTensor(BaseProcessTensor):
         self._canonicalise()
 
     def _canonicalise(self):
-
         W = self._mpo_tensor
         Dl, Dr = W.shape[0], W.shape[1]
-
-        phys_axes = tuple(range(2, W.ndim))
-
-        E = np.tensordot(W, np.conj(W), axes=(phys_axes, phys_axes))
-        E = np.transpose(E, (0, 2, 1, 3))
+        
+        # Contract physical indices to find the transfer matrix E
+        # W shape is (left, right, out, in)
+        # We contract the last two dimensions (the system physical legs)
+        E = np.einsum('abij,cdij->acbd', W, np.conj(W))
         E = E.reshape(Dl * Dl, Dr * Dr)
-
+        
         vals, vecs = np.linalg.eig(E)
-        idx = np.argmax(np.real(vals))
-        lam = np.real(vals[idx])
-        vr = vecs[:, idx]
-
-        vr = vr.reshape(Dr, Dr)
-
-        scale = np.sqrt(lam)
-        self._mpo_tensor = self._mpo_tensor / scale
-        self._first_mpo_tensor = self._first_mpo_tensor / scale
-
-        self._cap_tensor = vr / np.linalg.norm(vr)
+        idx = np.argmax(np.abs(vals))
+        lam = vals[idx]
+        
+        # Normalize the repeating tensor so the leading eigenvalue is exactly 1
+        # This prevents exponential growth/decay (the 143.1 error)
+        self._mpo_tensor = self._mpo_tensor / np.sqrt(np.abs(lam))
+        
+        # The right eigenvector is the fixed-point 'cap'
+        vr = vecs[:, idx].reshape(Dr, Dr)
+        # Ensure the cap is normalized such that Tr(rho) is preserved
+        self._cap_tensor = vr / np.trace(vr)
 
     def __len__(self) -> int:
         return 0
@@ -82,10 +87,7 @@ class TTInvariantProcessTensor(BaseProcessTensor):
     def set_initial_tensor(
             self,
             initial_tensor: Optional[ndarray] = None) -> None:
-        if initial_tensor is None:
-            self._initial_tensor = None
-        else:
-            self._initial_tensor = np.array(initial_tensor, dtype=NpDtype)
+        self._initial_tensor = np.array(initial_tensor, dtype=NpDtype) if initial_tensor is not None else None
 
     def get_initial_tensor(self) -> ndarray:
         return self._initial_tensor
@@ -94,23 +96,16 @@ class TTInvariantProcessTensor(BaseProcessTensor):
             self,
             step: int,
             transformed: Optional[bool] = True) -> ndarray:
-
-        assert transformed
-
         if step < 0:
             raise IndexError("Process tensor index out of bound.")
-
-        if step == 0:
-            return self._first_mpo_tensor
-        else:
-            return self._mpo_tensor
+        return self._first_mpo_tensor if step == 0 else self._mpo_tensor
 
     def get_cap_tensor(self, step: int) -> ndarray:
+        # For the infinite PT, we always use the fixed-point cap for t > 0
         if step == 0:
-            return np.array([1.0], dtype=NpDtype)
-        else:
-            return self._cap_tensor
+            # Boundary condition for the very first step
+            return np.ones(self._first_mpo_tensor.shape[1], dtype=NpDtype)
+        return np.diag(self._cap_tensor)
 
     def get_bond_dimensions(self) -> ndarray:
-        return np.array([self._mpo_tensor.shape[0],
-                         self._mpo_tensor.shape[1]])
+        return np.array([self._mpo_tensor.shape[0], self._mpo_tensor.shape[1]])
