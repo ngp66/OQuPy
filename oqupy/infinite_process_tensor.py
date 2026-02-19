@@ -4,6 +4,7 @@ import numpy as np
 from numpy import ndarray
 from .process_tensor import BaseProcessTensor, NpDtype, create_delta_lastindex
 
+
 class TTInvariantProcessTensor(BaseProcessTensor):
 
     def __init__(
@@ -17,7 +18,7 @@ class TTInvariantProcessTensor(BaseProcessTensor):
 
         self.uuid = str(uuid.uuid4())[:14]
         self._initial_tensor = None
-        
+
         hilbert_space_dimension = process_tensor.hilbert_space_dimension
         dt = process_tensor.dt
 
@@ -27,7 +28,6 @@ class TTInvariantProcessTensor(BaseProcessTensor):
         else:
             last_idx = int(max_step - 1) if max_step > 0 else 0
 
-        # Extract tensors
         self._mpo_tensor = process_tensor.get_mpo_tensor(last_idx).copy()
         self._first_mpo_tensor = process_tensor.get_mpo_tensor(0).copy()
 
@@ -57,25 +57,19 @@ class TTInvariantProcessTensor(BaseProcessTensor):
     def _canonicalise(self):
         W = self._mpo_tensor
         Dl, Dr = W.shape[0], W.shape[1]
-        
-        # Contract physical indices to find the transfer matrix E
-        # W shape is (left, right, out, in)
-        # We contract the last two dimensions (the system physical legs)
-        E = np.einsum('abij,cdij->acbd', W, np.conj(W))
-        E = E.reshape(Dl * Dl, Dr * Dr)
-        
-        vals, vecs = np.linalg.eig(E)
+
+        T = np.einsum('abii->ab', W)
+
+        vals, vecs = np.linalg.eig(T.T)
         idx = np.argmax(np.abs(vals))
         lam = vals[idx]
-        
-        # Normalize the repeating tensor so the leading eigenvalue is exactly 1
-        # This prevents exponential growth/decay (the 143.1 error)
-        self._mpo_tensor = self._mpo_tensor / np.sqrt(np.abs(lam))
-        
-        # The right eigenvector is the fixed-point 'cap'
-        vr = vecs[:, idx].reshape(Dr, Dr)
-        # Ensure the cap is normalized such that Tr(rho) is preserved
-        self._cap_tensor = vr / np.trace(vr)
+
+        #self._mpo_tensor = self._mpo_tensor / lam
+
+        r = np.real(vecs[:, idx])
+        r = r / np.sum(r)
+
+        self._cap_tensor = r.astype(NpDtype)
 
     def __len__(self) -> int:
         return 0
@@ -101,11 +95,9 @@ class TTInvariantProcessTensor(BaseProcessTensor):
         return self._first_mpo_tensor if step == 0 else self._mpo_tensor
 
     def get_cap_tensor(self, step: int) -> ndarray:
-        # For the infinite PT, we always use the fixed-point cap for t > 0
         if step == 0:
-            # Boundary condition for the very first step
             return np.ones(self._first_mpo_tensor.shape[1], dtype=NpDtype)
-        return np.diag(self._cap_tensor)
+        return self._cap_tensor
 
     def get_bond_dimensions(self) -> ndarray:
         return np.array([self._mpo_tensor.shape[0], self._mpo_tensor.shape[1]])
