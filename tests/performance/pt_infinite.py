@@ -1,6 +1,6 @@
 import numpy as np
 from oqupy import SimpleProcessTensor
-from oqupy import TTInvariantProcessTensor  
+from oqupy.infinite_process_tensor import TTInvariantProcessTensor  
 
 hs_dim = 2
 dt = 0.1
